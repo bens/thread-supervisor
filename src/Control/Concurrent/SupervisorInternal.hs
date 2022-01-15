@@ -1,4 +1,5 @@
 {-# LANGUAGE Strict #-}
+{-# LANGUAGE ExistentialQuantification #-}
 
 {-|
 Module      : Control.Concurrent.SupervisorInternal
@@ -16,6 +17,8 @@ module Control.Concurrent.SupervisorInternal where
 import           Prelude             hiding (lookup)
 
 import           Control.Monad       (void)
+import           Data.Functor.Contravariant
+                                     (Contravariant(contramap))
 import           Data.Default
 import           Data.Foldable       (foldl', for_, traverse_)
 import           Data.Functor        (($>))
@@ -59,7 +62,10 @@ instance Default InboxLength where
     def = InboxLength maxBound
 
 -- | Write end of 'Inbox' exposed to outside of actor.
-newtype ActorQ a = ActorQ (Inbox a)
+data ActorQ a = forall x. ActorQ (a -> x) (Inbox x)
+
+instance Contravariant ActorQ where
+  contramap f (ActorQ fn q) = ActorQ (fn . f) q
 
 -- | Create a new empty 'Inbox'.
 newInbox :: InboxLength -> IO (Inbox a)
@@ -70,10 +76,10 @@ send
   :: ActorQ a   -- ^ Write-end of target actor's message queue.
   -> a          -- ^ Message to be sent.
   -> IO ()
-send (ActorQ (Inbox inbox lenTVar _ limit)) msg = atomically $ do
+send (ActorQ fn (Inbox inbox lenTVar _ limit)) msg = atomically $ do
     len <- readTVar lenTVar
     if len < limit
-    then modifyTVar' lenTVar succ *> writeTQueue inbox msg
+    then modifyTVar' lenTVar succ *> writeTQueue inbox (fn msg)
     else retrySTM
 
 -- | Send a message to sending actor itself.  Block while the queue is full.
@@ -83,7 +89,7 @@ sendToMe
     :: Inbox a  -- ^ Inbox the message to be send to.
     -> a        -- ^ Message to be sent.
     -> IO ()
-sendToMe = send . ActorQ
+sendToMe = send . ActorQ id
 
 -- | Try to send a message to given 'ActorQ'.  Return Nothing if the queue is
 -- already full.
@@ -91,10 +97,10 @@ trySend
     :: ActorQ a -- ^ Write-end of target actor's message queue.
     -> a        -- ^ Message to be sent.
     -> IO (Maybe ())
-trySend (ActorQ (Inbox inbox lenTVar _ limit)) msg = atomically $ do
+trySend (ActorQ fn (Inbox inbox lenTVar _ limit)) msg = atomically $ do
     len <- readTVar lenTVar
     if len < limit
-    then modifyTVar' lenTVar succ *> writeTQueue inbox msg $> Just ()
+    then modifyTVar' lenTVar succ *> writeTQueue inbox (fn msg) $> Just ()
     else pure Nothing
 
 -- | Try to end a message to sending actor itself.  Return Nothing if the queue
@@ -105,11 +111,11 @@ trySendToMe
     :: Inbox a  -- ^ Inbox the message to be send to.
     -> a        -- ^ Message to be sent.
     -> IO (Maybe ())
-trySendToMe = trySend . ActorQ
+trySendToMe = trySend . ActorQ id
 
 -- | Number of elements currently held by the 'ActorQ'.
 length :: ActorQ a -> IO Word
-length (ActorQ q) = readTVarIO $ inboxLength q
+length (ActorQ _fn q) = readTVarIO $ inboxLength q
 
 {-|
     Perform selective receive from given 'Inbox'.
@@ -267,7 +273,7 @@ newBoundedActor
     -> IO (Actor message result)
 newBoundedActor maxQLen handler = do
     q <- newInbox maxQLen
-    pure . Actor (ActorQ q) $ handler q
+    pure . Actor (ActorQ id q) $ handler q
 
 {-
     State machine behavior.
@@ -639,7 +645,7 @@ newSupervisor
 newSupervisor strategy restartSensitivity childSpecs inbox = bracket newThreadMap (killAllSupervisedThread inbox) initSupervisor
   where
     initSupervisor children = do
-        startAllSupervisedThread (ActorQ inbox) children childSpecs
+        startAllSupervisedThread (ActorQ id inbox) children childSpecs
         newStateMachine (newIntenseRestartDetector restartSensitivity) handler inbox
       where
         handler :: IntenseRestartDetector -> SupervisorMessage -> IO (Either () IntenseRestartDetector)
@@ -665,12 +671,12 @@ newSupervisor strategy restartSensitivity childSpecs inbox = bracket newThreadMa
             restartNeeded _         _      = True
 
         handler hist (StartChild (ChildSpec _ action) cont) =
-            (newSupervisedThread (ActorQ inbox) children (ChildSpec Temporary action) >>= cont) $> Right hist
+            (newSupervisedThread (ActorQ id inbox) children (ChildSpec Temporary action) >>= cont) $> Right hist
 
-    restartChild OneForOne children spec = void $ newSupervisedThread (ActorQ inbox) children spec
+    restartChild OneForOne children spec = void $ newSupervisedThread (ActorQ id inbox) children spec
     restartChild OneForAll children _    = do
         killAllSupervisedThread inbox children
-        startAllSupervisedThread (ActorQ inbox) children childSpecs
+        startAllSupervisedThread (ActorQ id inbox) children childSpecs
 
 -- | Ask the supervisor to spawn new temporary child thread.  Returns 'ThreadId'
 -- of the new child.
