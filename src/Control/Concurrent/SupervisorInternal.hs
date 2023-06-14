@@ -362,7 +362,10 @@ callAsync
     -> (ServerCallback a -> cmd)    -- ^ Request to the server without callback supplied.
     -> (Maybe a -> IO b)            -- ^ callback to process return value of the call.  Nothing is given on timeout.
     -> IO (Async b)
-callAsync tout srv req cont = async $ call tout srv req >>= cont
+callAsync (CallTimeout usec) srv req cont = do
+    rVar <- newEmptyTMVarIO
+    send srv . req $ atomically . putTMVar rVar
+    async $ timeout usec (atomically (takeTMVar rVar)) >>= cont
 
 -- | Send an request to a server but ignore return value.
 callIgnore
